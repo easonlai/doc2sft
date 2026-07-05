@@ -150,18 +150,18 @@ sequenceDiagram
 
 ```text
 Doc2SFT/
-├── data_input/             # Drop your source PDFs here (Git ignored)
+├── data_input/                   # Drop your source PDFs here (Git ignored)
 │   └── .gitkeep
-├── data_output/            # Final ShareGPT SFT training datasets saved here
+├── data_output/                  # Final ShareGPT SFT training datasets saved here
 │   └── .gitkeep
-├── logs/                   # State engine checkpointing & pipeline logs
+├── logs/                         # State engine checkpointing & pipeline logs
 │   ├── pipeline_run.log
-│   └── state.json          # Continuous state tracker for zero-loss recovery
+│   └── state.json                # Continuous state tracker for zero-loss recovery
 ├── .env.example.m3air_qwen2-1.5b # Blueprint template for lightweight edge hardware
-├── .env.example.m5pro_qwen3-14b # Blueprint template for lightweight edge hardware
-├── .gitignore              # Enforces strict data and token credential isolation
-├── generate_data.py        # Core asynchronous framework file
-└── requirements.txt        # Verified project dependency configuration
+├── .env.example.m5pro_qwen3-14b  # Blueprint template for lightweight edge hardware
+├── .gitignore                    # Enforces strict data and token credential isolation
+├── generate_data.py              # Core asynchronous framework file
+└── requirements.txt              # Verified project dependency configuration
 ```
 
 ---
