@@ -10,7 +10,7 @@
 
 ## 💡 Why Doc2SFT?
 
-The Open Source community has access to incredible Small Language Models (SLMs) like Qwen2 (lightweight 1.5B/7B) and Llama-3 (8B). However, the biggest bottleneck for fine-tuning these models on proprietary enterprise data is **Data Quality**.
+The Open Source community has access to incredible Small and Mid-size Language Models like Qwen2 (lightweight 1.5B/7B), Llama-3 (8B), and highly capable mid-range models like Qwen3 (14B). However, the biggest bottleneck for fine-tuning these models on proprietary enterprise data is **Data Quality**.
 
 When asking an LLM to generate training data from raw text, standard scripts fail due to:
 1. **JSON Formatting Collapse:** Smaller models frequently break JSON structures, causing pipelines to crash entirely.
@@ -154,7 +154,8 @@ Doc2SFT/
 ├── logs/                   # State engine checkpointing & pipeline logs
 │   ├── pipeline_run.log
 │   └── state.json          # Continuous state tracker for zero-loss recovery
-├── .env.example.m3air_16gb # Blueprint template for lightweight edge hardware
+├── .env.example.m3air_qwen2-1.5b # Blueprint template for lightweight edge hardware
+├── .env.example.m5pro_qwen3-14b # Blueprint template for lightweight edge hardware
 ├── .gitignore              # Enforces strict data and token credential isolation
 ├── generate_data.py        # Core asynchronous framework file
 └── requirements.txt        # Verified project dependency configuration
@@ -187,16 +188,22 @@ touch data_input/.gitkeep data_output/.gitkeep logs/.gitkeep
 ## ⚙️ Configuration & Execution
 
 ### Step 1: Configure your `.env` Profile
-Doc2SFT is deeply customizable. Copy the provided blueprint to create your active `.env` file:
+Doc2SFT is deeply customizable. Copy a provided blueprint to create your active `.env` file based on your hardware:
+
+**For Edge Devices (e.g., M3 Air with 16GB RAM):**
 ```bash
-cp .env.example.m3air_16gb .env
+cp .env.example.m3air_qwen2-1.5b .env
+```
+**For Workstations (e.g., M5 Pro with 24GB RAM):**
+```bash
+cp .env.example.m5pro_qwen3-14b .env
 ```
 
 Open the `.env` file and tune the parameters to match your hardware and dataset goals. 
 
 **LLM & Endpoint Configuration**
 * `OLLAMA_HOST`: The URL of your local or remote Ollama instance (default: `http://localhost:11434`).
-* `OLLAMA_MODEL`: The model used for generation and judging (e.g., `qwen2:1.5b` for edge hardware, `llama3:8b` or larger for workstations).
+* `OLLAMA_MODEL`: The model used for generation and judging (e.g., `qwen2:1.5b` for edge hardware, `qwen3:14b` or larger for workstations).
 
 **Pipeline Behavior**
 * `TARGET_YIELD`: The total number of high-quality data pairs you want extracted across all documents.
@@ -204,8 +211,8 @@ Open the `.env` file and tune the parameters to match your hardware and dataset 
 * `SYSTEM_PROMPT`: Hardcode your target persona to prevent model drift (e.g., `"You are an expert AI governance assistant."`), or set to `auto` to let large models infer the domain dynamically.
 
 **Quality & Hardware Constraints (CRITICAL)**
-* `MIN_QUALITY_SCORE`: (Scale 1-5). Sets the threshold for the AI Judge. Set to `1` to bypass the judge entirely if you want maximum speed on small models, or `4` for strict enterprise quality.
-* `CONCURRENCY_LIMIT`: Controls async chunking execution. **Set to `1`** for 16GB Unified Memory (M2/M3 MacBooks) to prevent swap thrashing and lockups. Scale up to `3-5` if running on high-VRAM clusters.
+* `MIN_QUALITY_SCORE`: (Scale 1-5). Sets the threshold for the AI Judge. Set to `1` to bypass the judge entirely if you want maximum speed on small models, or `4` for strict enterprise quality using mid-range models (14B+).
+* `CONCURRENCY_LIMIT`: Controls async chunking execution. **Set to `1`** for 16GB Unified Memory (M2/M3 MacBooks) to prevent swap thrashing and lockups. Scale up to `2-5` if running on high-VRAM clusters or M5 Pro setups.
 * `OLLAMA_NUM_CTX_QA`: Context window size. Set carefully based on your VRAM (e.g., `4096` for standard QA, `8192` for CoT).
 
 ### Step 2: Run the Pipeline
