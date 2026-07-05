@@ -24,68 +24,86 @@ When asking an LLM to generate training data from raw text, standard scripts fai
 
 ## 🏗️ Core Architecture & Design Logic
 
-Doc2SFT is not just a prompt wrapper; it is an intelligent, self-healing pipeline built on four architectural pillars:
+Doc2SFT is built on five highly isolated, fault-tolerant architectural blocks.
 
-### 1. Architectural Pipeline Flow
-The entire framework operates as an asynchronous, non-blocking pipeline designed to enforce structural and factual consistency at every checkpoint.
+### 1. Global Context Map Generator (Anti-Myopia)
+Before chunking begins, the pipeline extracts all text and forces the LLM to generate a cross-document map. This solves the "Chunk Myopia" problem by giving the AI situational awareness of the entire domain, even when it is only processing a small 500-word slice.
+
+```mermaid
+graph LR
+    A[Doc 1] & B[Doc 2] & C[Doc N] --> D[Universal Text Extraction]
+    D --> E[LLM: Analyze Dependencies & Intersections]
+    E --> F[(Global Context Map)]
+    F -.->|Injected as System Prompt| G[Chunk Generation 1]
+    F -.->|Injected as System Prompt| H[Chunk Generation 2]
+```
+
+### 2. Asynchronous Processing Loop
+To maximize GPU/Unified Memory utilization without causing out-of-memory (OOM) crashes, chunk processing is handled by an asynchronous semaphore queue. Concurrency limits are strictly controlled by the `.env` configuration.
+
+```mermaid
+sequenceDiagram
+    participant Main as Pipeline Core
+    participant Sem as Async Semaphore (Limit=N)
+    participant LLM as Local LLM Endpoint
+    Main->>Sem: Request execution slot for Chunk hash_id
+    Sem-->>Main: Slot granted
+    Main->>LLM: Await async API generate()
+    Note over LLM: Hardware processes<br/>N chunks concurrently
+    LLM-->>Main: Response returned
+    Main->>Sem: Release slot for next Chunk
+```
+
+### 3. Structural JSON & Pydantic Validation
+Lightweight models frequently add conversational fluff (e.g., *"Here is your data:"*) or forget brackets. The pipeline uses an Omni-Directional Regex Extractor to strip noise, followed by strict Pydantic schema matching to guarantee dataset integrity.
 
 ```mermaid
 graph TD
-    A[Raw PDFs in data_input] --> B[Universal PDF Text Extractor]
-    B --> C[Global Context Map Generator]
-    B --> D[Recursive Chunking Engine]
-    C --> E[Asynchronous Processing Loop]
-    D --> E
-    E --> F{Structural JSON & Pydantic Validation}
-    F -- Success --> G{AI Judge Quality Check}
-    F -- Failure/Malformed --> H[Context-Isolated Retry Engine]
-    H -->|Retry 1 to 3| E
-    H -->|Exhausted / Fails 3x| I[Quarantine Chunk / Leave Uncompleted]
-    G -- Score >= MIN_QUALITY_SCORE --> J[Async File Lock]
-    G -- Low Quality / Hallucinated --> K[Log Error & Discard]
-    J --> L[Append to final dataset.jsonl]
-    L --> M[Commit Progress to state.json Checkpoint]
+    A[Raw LLM Output String] --> B[Regex Omni-Extractor]
+    B -->|Strips markdown & conversational fluff| C{json.loads}
+    C -- JSONDecodeError --> D[Trigger Retry Engine]
+    C -- Success --> E{Pydantic Schema Match}
+    E -- ValidationError --> D
+    E -- Success --> F[Validated JSON Objects]
 ```
 
-### 2. The Context-Isolated Self-Healing Retry Loop
-To guarantee that lightweight models do not enter an uncontrollable error loop, the self-healing retry block keeps a strict isolation layer. Instead of appending old error chains recursively, it reference-checks a pristine `base_prompt` every time.
+### 4. Context-Isolated Retry Engine
+If JSON validation fails, the pipeline does *not* recursively append error messages to the old prompt (which bloats context and confuses small models). Instead, it isolates the error and re-injects it against a pristine `base_prompt`.
 
-```text
-+------------------------------------------------------------------------+
-|                      Processing Chunk Async Loop                       |
-+------------------------------------------------------------------------+
-                                    |
-                                    v
-                       [ Generate Ollama Response ]
-                                    |
-                                    v
-                     { Extract JSON Bracket Bounds }
-                                    |
-                    +---------------+---------------+
-                    |                               |
-          [ Valid JSON Array ]             [ Parsing/Schema Collapse ]
-                    |                               |
-                    v                               v
-         ( Trigger LLM As A Judge )         ( Log Exception Status )
-                    |                               |
-           +--------+--------+                      v
-           |                 |          { Check Remaining Retries? }
-    [ Pass Score ]    [ Low Score ]                 |
-           |                 |             +--------+--------+
-           v                 v             |                 |
-     ( File Lock )    ( Clear Memory )  [ Yes > 0 ]      [ No == 0 ]
-           |                 |             |                 |
-           v                 v             v                 v
-   { Save Progress }    { Discard }  ( Re-inject pristine )  ( Quarantine Chunk )
-                                     ( base_prompt + raw  )  ( Do Not Save to   )
-                                     ( json + error stack )  ( state.json Check )
+```mermaid
+graph TD
+    A[Parsing or Schema Collapse] --> B{Check Remaining Retries?}
+    B -- Yes > 0 --> C[Re-inject pristine base_prompt <br/>+ raw json + error stack]
+    C --> D[Retry API Call]
+    D --> E((Validation Loop))
+    B -- No == 0 --> F[QUARANTINE CHUNK]
+    F --> G[1. Log Warning Array]
+    F --> H[2. Discard Corrupted Data]
+    F --> I[3. Keep state.json un-marked<br/>so next run retries it]
 ```
 
-### 3. Global Context Mapping (Anti-Myopia)
-Before chunking, the pipeline scans the documents to generate a cross-document **Global Context Map**. This map is injected into every subsequent chunk generation, ensuring the AI maintains situational awareness of the broader domain, even when analyzing a fragmented 500-word slice.
+### 5. LLM-as-a-Judge (Hallucination Defense)
+Even if an LLM outputs perfect JSON, it may hallucinate facts. Doc2SFT deploys a secondary, zero-temperature "Auditor" prompt to ruthlessly grade the generated data against the original ground-truth chunk. 
 
-### 4. Zero-Byte Resilient State Preservation
-Network timeouts or out-of-memory errors happen. Doc2SFT features a continuous asynchronous state tracker (`state.json`). If the pipeline is interrupted, simply run it again. It will instantly skip successfully processed chunks, safely quarantine unrecoverable chunks, and seamlessly resume data extraction without duplicating a single line of data.
+```mermaid
+sequenceDiagram
+    participant P as Pipeline
+    participant J as AI Judge
+    
+    P->>J: Transmit [Source Chunk] + [Generated QA Pair]
+    Note over J: Prompt: "Act as strict AI Auditor. Score 1 to 5."
+    J-->>P: Returns JSON: {"score": 4}
+    
+    alt Score >= MIN_QUALITY_SCORE
+        P->>P: Data Approved -> Async Lock -> Append to .jsonl
+    else Score < MIN_QUALITY_SCORE
+        P->>P: Hallucination Detected -> Silently Discard Data
+    end
+    
+    opt Low-Spec Hardware Fastpath
+        Note over P: If MIN_QUALITY_SCORE = 1 (e.g. for Apple M3 Edge Devices),<br/>the pipeline dynamically bypasses the Judge to preserve Unified Memory.
+    end
+```
 
 ---
 
@@ -100,7 +118,6 @@ Doc2SFT/
 ├── logs/                   # State engine checkpointing & pipeline logs
 │   ├── pipeline_run.log
 │   └── state.json          # Continuous state tracker for zero-loss recovery
-│   └── .gitkeep
 ├── .env.example.m3air_16gb # Blueprint template for lightweight edge hardware
 ├── .gitignore              # Enforces strict data and token credential isolation
 ├── generate_data.py        # Core asynchronous framework file
@@ -119,7 +136,7 @@ Doc2SFT/
 ### Installation
 ```bash
 # Clone the repository
-git clone [https://github.com/yourusername/Doc2SFT.git](https://github.com/yourusername/Doc2SFT.git)
+git clone https://github.com/yourusername/Doc2SFT.git
 cd Doc2SFT
 
 # Install dependencies
@@ -192,4 +209,3 @@ When opening a PR, please ensure your code handles asynchronous state locks safe
 
 ## 📜 License
 Distributed under the MIT License. See `LICENSE` for more information.
-```
