@@ -178,34 +178,46 @@ cd Doc2SFT
 # Install dependencies
 pip install -r requirements.txt
 
-# Create necessary directories
+# Create necessary directories to preserve git structure
 touch data_input/.gitkeep data_output/.gitkeep logs/.gitkeep
 ```
 
-### Configuration
-Doc2SFT relies on a strict `.env` file for execution behavior. We provide optimized profile templates for different hardware setups.
+---
 
-Copy the provided example profile to create your active `.env`:
+## ⚙️ Configuration & Execution
+
+### Step 1: Configure your `.env` Profile
+Doc2SFT is deeply customizable. Copy the provided blueprint to create your active `.env` file:
 ```bash
-# Example: Optimized for Apple M3 Air with 16 GB RAM using a lightweight 1.5B model
 cp .env.example.m3air_16gb .env
 ```
 
-**Key `.env` Parameters:**
-* `GENERATION_STYLE`: Set to `qa` (Direct Question/Answer) or `cot` (Chain-of-Thought reasoning).
-* `CONCURRENCY_LIMIT`: Controls memory pressure. Set to `1` for 16GB RAM/MacBooks to prevent swap thrashing, or scale up on massive multi-GPU/cluster rigs.
-* `SYSTEM_PROMPT`: Hardcode your target persona (e.g., `"You are an expert AI governance assistant."`) or set to `auto` for large models to auto-detect the domain.
+Open the `.env` file and tune the parameters to match your hardware and dataset goals. 
 
----
+**LLM & Endpoint Configuration**
+* `OLLAMA_HOST`: The URL of your local or remote Ollama instance (default: `http://localhost:11434`).
+* `OLLAMA_MODEL`: The model used for generation and judging (e.g., `qwen2:1.5b` for edge hardware, `llama3:8b` or larger for workstations).
 
-## ⚙️ Usage
+**Pipeline Behavior**
+* `TARGET_YIELD`: The total number of high-quality data pairs you want extracted across all documents.
+* `GENERATION_STYLE`: Set to `qa` for direct knowledge-extraction, or `cot` for reasoning paths.
+* `SYSTEM_PROMPT`: Hardcode your target persona to prevent model drift (e.g., `"You are an expert AI governance assistant."`), or set to `auto` to let large models infer the domain dynamically.
+
+**Quality & Hardware Constraints (CRITICAL)**
+* `MIN_QUALITY_SCORE`: (Scale 1-5). Sets the threshold for the AI Judge. Set to `1` to bypass the judge entirely if you want maximum speed on small models, or `4` for strict enterprise quality.
+* `CONCURRENCY_LIMIT`: Controls async chunking execution. **Set to `1`** for 16GB Unified Memory (M2/M3 MacBooks) to prevent swap thrashing and lockups. Scale up to `3-5` if running on high-VRAM clusters.
+* `OLLAMA_NUM_CTX_QA`: Context window size. Set carefully based on your VRAM (e.g., `4096` for standard QA, `8192` for CoT).
+
+### Step 2: Run the Pipeline
 
 1. **Input:** Drop your target `.pdf` files into the `/data_input` folder.
-2. **Execute:** Run the pipeline.
+2. **Execute:** Start the generation process.
    ```bash
    python generate_data.py
    ```
 3. **Output:** Your pristine, fine-tune-ready data will be saved in `/data_output/dataset_qa.jsonl` (or `dataset_cot.jsonl`).
+
+*Note: If the script is interrupted, simply run it again. The asynchronous `state.json` tracker will automatically pick up exactly where it left off.*
 
 ### Example Output (ShareGPT Format)
 The generated data is perfectly structured for immediate ingestion into frameworks like **Axolotl**, **MLX**, **Llama-Factory**, or **Unsloth**:
