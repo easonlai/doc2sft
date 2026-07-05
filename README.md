@@ -10,15 +10,18 @@
 
 ## 💡 Why Doc2SFT?
 
-The Open Source community has access to incredible Small and Mid-size Language Models like Qwen2 (lightweight 1.5B/7B), Llama-3 (8B), and highly capable mid-range models like Qwen3 (14B). However, the biggest bottleneck for fine-tuning these models on proprietary enterprise data is **Data Quality**.
+The Open Source community has access to incredible Small and Mid-size Language Models like Qwen2 (lightweight 1.5B/7B), Llama-3 (8B), and highly capable mid-range models like Qwen3 (14B). However, the biggest bottlenecks for fine-tuning these models on proprietary enterprise data are **Data Privacy** and **Data Quality**.
 
-When asking an LLM to generate training data from raw text, standard scripts fail due to:
-1. **JSON Formatting Collapse:** Smaller models frequently break JSON structures, causing pipelines to crash entirely.
-2. **Chunk Myopia:** Text chunking destroys document-wide context, leading to inaccurate QA pairs.
-3. **The "Garbage In" Problem:** Without strict validation, LLMs generate hallucinated or low-quality data.
-4. **Hardware Exhaustion:** Processing long contexts rapidly overwhelms Unified Memory on edge devices or standard GPUs.
+When asking an AI to generate training data from raw proprietary text, standard scripts and cloud APIs fail due to:
+1. **The Cloud Privacy Breach:** Sending internal enterprise PDFs to external cloud APIs exposes highly sensitive IP and trade secrets to third-party model providers.
+2. **JSON Formatting Collapse:** Smaller local models frequently break JSON structures, causing offline pipelines to crash entirely.
+3. **Chunk Myopia:** Text chunking destroys document-wide context, leading to inaccurate QA pairs.
+4. **The "Garbage In" Problem:** Without strict validation, LLMs generate hallucinated or low-quality data.
+5. **Hardware Exhaustion:** Processing long contexts rapidly overwhelms Unified Memory on edge devices or standard GPUs.
 
-**Doc2SFT solves this.** It is engineered as a bulletproof state-machine that safely extracts golden data across any environment—from an **M3 MacBook Air with 16 GB RAM** running a lightweight 1.5B model, up to ultra-large scale configurations on enterprise cluster infrastructure. The pipeline's scaling capability is constrained entirely by your available hardware footprint, not by software limitations.
+**Doc2SFT solves this.** It is an **offline-first, 100% locally isolated** solution. By integrating directly with local LLMs via Ollama, it guarantees that your proprietary input data never leaves your infrastructure or gets exposed to the cloud. 
+
+Engineered as a bulletproof state-machine, it safely extracts golden data across any environment—from an **M3 MacBook Air with 16 GB RAM** running a lightweight 1.5B model, up to ultra-large scale configurations on enterprise cluster infrastructure. You get cloud-grade dataset generation with absolute, air-gapped data security.
 
 ---
 
