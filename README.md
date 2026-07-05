@@ -24,9 +24,45 @@ When asking an LLM to generate training data from raw text, standard scripts fai
 
 ## 🏗️ Core Architecture & Design Logic
 
-Doc2SFT is built on five highly isolated, fault-tolerant architectural blocks.
+### Master Blueprint: End-to-End Pipeline Flow
+Before diving into the specific mechanisms, here is the macro view of how Doc2SFT processes documents from raw input to fine-tune-ready output.
 
-### 1. Global Context Map Generator (Anti-Myopia)
+```mermaid
+graph TD
+    subgraph Input Phase
+        A[Raw PDF Documents] --> B(Universal PDF Extractor)
+        B --> C(Recursive Text Chunking)
+        B --> D(Global Context Map Generator)
+    end
+
+    subgraph Asynchronous Generation Loop
+        C --> E{Async Semaphore Queue}
+        D -.->|Injected Context| F
+        E --> F[Local LLM / Ollama]
+        F --> G{Structural JSON Check}
+    end
+
+    subgraph Validation & Self-Healing
+        G -- Fails --> H[Context-Isolated Retry Engine]
+        H -->|Retries < 3| F
+        H -->|Retries = 3| I((Quarantine Chunk))
+        G -- Passes --> J{AI Judge Quality Check}
+    end
+
+    subgraph Output Phase
+        J -- Score < Target --> K((Discard Hallucinated Data))
+        J -- Score >= Target --> L[Async File Lock]
+        L --> M[dataset_qa.jsonl]
+        L --> N[(state.json Checkpoint)]
+    end
+```
+
+---
+
+### The 5 Architectural Pillars
+Doc2SFT is built on five highly isolated, fault-tolerant architectural blocks that power the end-to-end flow above.
+
+#### 1. Global Context Map Generator (Anti-Myopia)
 Before chunking begins, the pipeline extracts all text and forces the LLM to generate a cross-document map. This solves the "Chunk Myopia" problem by giving the AI situational awareness of the entire domain, even when it is only processing a small 500-word slice.
 
 ```mermaid
@@ -38,7 +74,7 @@ graph LR
     F -.->|Injected as System Prompt| H[Chunk Generation 2]
 ```
 
-### 2. Asynchronous Processing Loop
+#### 2. Asynchronous Processing Loop
 To maximize GPU/Unified Memory utilization without causing out-of-memory (OOM) crashes, chunk processing is handled by an asynchronous semaphore queue. Concurrency limits are strictly controlled by the `.env` configuration.
 
 ```mermaid
@@ -54,7 +90,7 @@ sequenceDiagram
     Main->>Sem: Release slot for next Chunk
 ```
 
-### 3. Structural JSON & Pydantic Validation
+#### 3. Structural JSON & Pydantic Validation
 Lightweight models frequently add conversational fluff (e.g., *"Here is your data:"*) or forget brackets. The pipeline uses an Omni-Directional Regex Extractor to strip noise, followed by strict Pydantic schema matching to guarantee dataset integrity.
 
 ```mermaid
@@ -67,7 +103,7 @@ graph TD
     E -- Success --> F[Validated JSON Objects]
 ```
 
-### 4. Context-Isolated Retry Engine
+#### 4. Context-Isolated Retry Engine
 If JSON validation fails, the pipeline does *not* recursively append error messages to the old prompt (which bloats context and confuses small models). Instead, it isolates the error and re-injects it against a pristine `base_prompt`.
 
 ```mermaid
@@ -82,7 +118,7 @@ graph TD
     F --> I[3. Keep state.json un-marked<br/>so next run retries it]
 ```
 
-### 5. LLM-as-a-Judge (Hallucination Defense)
+#### 5. LLM-as-a-Judge (Hallucination Defense)
 Even if an LLM outputs perfect JSON, it may hallucinate facts. Doc2SFT deploys a secondary, zero-temperature "Auditor" prompt to ruthlessly grade the generated data against the original ground-truth chunk. 
 
 ```mermaid
@@ -136,7 +172,7 @@ Doc2SFT/
 ### Installation
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/Doc2SFT.git
+git clone [https://github.com/yourusername/Doc2SFT.git](https://github.com/yourusername/Doc2SFT.git)
 cd Doc2SFT
 
 # Install dependencies
