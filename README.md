@@ -65,21 +65,81 @@ graph TD
 ---
 
 ### The 5 Architectural Pillars
+Doc2SFT is built on five highly isolated, fault-tolerant architectural blocks that power the end-to-end flow above.
 
 #### 1. Global Context Map Generator (Anti-Myopia)
 Before chunking begins, the pipeline extracts all text and forces the LLM to generate a cross-document map. This solves the "Chunk Myopia" problem by giving the AI situational awareness of the entire domain, even when it is only processing a small 500-word slice.
 
-#### 2. LangChain Semantic Text Segmentation
-Doc2SFT abandons naive character slicing. It implements LangChain's `RecursiveCharacterTextSplitter` to guarantee that chunks always break cleanly at paragraph (`\n\n`) or sentence (`.`) boundaries, ensuring the LLM receives pristine, unbroken semantic context.
+```mermaid
+graph LR
+    A[Doc 1] & B[Doc 2] & C[Doc N] --> D[pypdf Text Extraction]
+    D --> E[LLM: Analyze Dependencies & Intersections]
+    E --> F[(Global Context Map)]
+    F -.->|Injected as System Prompt| G[Chunk Generation 1]
+    F -.->|Injected as System Prompt| H[Chunk Generation 2]
+```
 
-#### 3. Native JSON Mode & Pydantic V2 Self-Healing
-Lightweight models frequently add conversational fluff or drop brackets. Doc2SFT enforces a strict C-level JSON Grammar Mask (`format="json"`) directly into the Ollama inference engine. If the output still violates schema, Pydantic V2 isolates the exact error (e.g., `[messages -> 1 -> role] Field required`) and the Context-Isolated Retry Engine re-injects this exact failure stack against a pristine `base_prompt` to self-heal without bloating the context window.
+#### 2. Asynchronous Processing Loop
+To maximize GPU/Unified Memory utilization without causing out-of-memory (OOM) crashes, chunk processing is handled by an asynchronous semaphore queue. Concurrency limits are strictly controlled by the `.env` configuration.
 
-#### 4. Enterprise Telemetry & Asynchronous Logging
-Doc2SFT features a non-blocking background queue logger (`traceability.jsonl`) that injects async context variables into the `LogRecord`. It serializes every retry loop, hardware latency metric, and Pydantic validation collapse without ever blocking the main asynchronous generation loop. 
+```mermaid
+sequenceDiagram
+    participant Main as Pipeline Core
+    participant Sem as Async Semaphore (Limit=N)
+    participant LLM as Ollama AsyncClient
+    Main->>Sem: Request execution slot for Chunk hash_id
+    Sem-->>Main: Slot granted
+    Main->>LLM: Await async generate()
+    Note over LLM: Hardware processes<br/>N chunks concurrently
+    LLM-->>Main: Response returned
+    Main->>Sem: Release slot for next Chunk
+```
+
+#### 3. Native JSON Mode & Pydantic V2 Validation
+Lightweight models frequently add conversational fluff or drop brackets. Doc2SFT enforces a strict C-level JSON Grammar Mask (`format="json"`) directly into the Ollama inference engine. If the output still violates schema, Pydantic V2 isolates the exact error (e.g., `[messages -> 1 -> role] Field required`) to trigger the self-healing loops.
+
+```mermaid
+graph TD
+    A[Ollama JSON Mask format='json'] --> B[Omni-Extractor Boundary Check]
+    B --> C{Pydantic V2 Schema Match}
+    C -- ValidationError --> D[Extract e.errors]
+    D --> E[Trigger Retry Engine]
+    C -- Success --> F[Validated JSON Objects]
+```
+
+#### 4. Context-Isolated Retry Engine
+If JSON validation fails, the pipeline does *not* recursively append error messages to the old prompt (which bloats context and confuses small models). Instead, it isolates the exact Pydantic error stack and re-injects it against a pristine `base_prompt`.
+
+```mermaid
+graph TD
+    A[Pydantic Schema Collapse] --> B{Check Remaining Retries?}
+    B -- Yes > 0 --> C[Re-inject pristine base_prompt <br/>+ exact pydantic_errors stack]
+    C --> D[Retry API Call]
+    D --> E((Validation Loop))
+    B -- No == 0 --> F[QUARANTINE CHUNK]
+    F --> G[1. Log to traceability.jsonl]
+    F --> H[2. Discard Corrupted Data]
+    F --> I[3. Exclude from state.json]
+```
 
 #### 5. LLM-as-a-Judge & Fault-Tolerant State Gaps
 Even if an LLM outputs perfect JSON, it may hallucinate facts. Doc2SFT deploys a secondary, zero-temperature "Auditor" prompt to ruthlessly grade the generated data against the original ground-truth chunk. Failed chunks are safely quarantined, and the `state.json` file deliberately leaves "gaps" in its tracking arrays. This allows you to restart the pipeline anytime, and it will automatically target only the missing/quarantined chunks.
+
+```mermaid
+sequenceDiagram
+    participant P as Pipeline
+    participant J as AI Judge (JSON Mode)
+    
+    P->>J: Transmit [Source Chunk] + [Generated QA Pair]
+    Note over J: Prompt: "Act as strict AI Auditor. Score 1 to 5."
+    J-->>P: Returns JSON: {"score": 4}
+    
+    alt Score >= MIN_QUALITY_SCORE
+        P->>P: Data Approved -> Async Lock -> Append to .jsonl
+    else Score < MIN_QUALITY_SCORE
+        P->>P: Hallucination Detected -> Silently Discard Data
+    end
+```
 
 ---
 
