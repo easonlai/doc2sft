@@ -1,423 +1,414 @@
+import asyncio
 import os
 import re
 import json
-import asyncio
-import logging
+import queue
 import hashlib
+import logging
+import logging.handlers
+import contextvars
 import time
-from pathlib import Path
+from datetime import datetime, timezone
 from typing import List, Optional
 
+# Load environment configuration before initializing pipeline
 from dotenv import load_dotenv
-import ollama
-import tiktoken
-import fitz  # PyMuPDF
-from pydantic import BaseModel, ValidationError
-from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
-from rich.prompt import Confirm
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-
-# ==========================================
-# 0. Load Environment Variables & Initialize
-# ==========================================
 load_dotenv()
 
-# Global Async Lock for safe file I/O operations (Fixes Race Conditions)
-file_lock = asyncio.Lock()
+from pypdf import PdfReader
+from pydantic import BaseModel, Field, ValidationError
+from ollama import AsyncClient
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:14b")
-INPUT_DIR = Path(os.getenv("INPUT_DIR", "./data_input"))
-OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "./data_output"))
-LOG_DIR = Path(os.getenv("LOG_DIR", "./logs"))
-TARGET_YIELD = int(os.getenv("TARGET_YIELD", "500"))
-AUTO_BYPASS = os.getenv("AUTO_BYPASS_WARNING", "False").lower() == "true"
-GENERATION_STYLE = os.getenv("GENERATION_STYLE", "cot").lower()
-TARGET_LANGUAGE = os.getenv("TARGET_LANGUAGE", "English")
-SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", "auto").strip()
-CONCURRENCY_LIMIT = int(os.getenv("CONCURRENCY_LIMIT", "2"))
-MIN_QUALITY_SCORE = int(os.getenv("MIN_QUALITY_SCORE", "4"))
-CHECKPOINT_FILE = Path(os.getenv("CHECKPOINT_FILE", "./logs/state.json"))
-TEMPERATURE = float(os.getenv("TEMPERATURE", "0.1"))
+# =====================================================================
+# 1. OBSERVABILITY & TELEMETRY ENGINE (COROUTINE-SAFE)
+# =====================================================================
+logger_ctx = contextvars.ContextVar("logger_ctx", default={})
 
-# Hardware & Token Optimization based on Generation Style
-if GENERATION_STYLE == "cot":
-    NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX_COT", "8192"))
-    NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT_COT", "2500"))
-    TOKENS_PER_PAIR = 400
-else:
-    NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX_QA", "4096"))
-    NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT_QA", "1000"))
-    TOKENS_PER_PAIR = 150
+class ContextInjectingFilter(logging.Filter):
+    """Injects async context variables into the LogRecord BEFORE it hits the background thread."""
+    def filter(self, record):
+        ctx = logger_ctx.get()
+        # Attach variables directly to the record so all formatters can see them
+        record.pipeline_stage = getattr(record, "stage", ctx.get("stage", "system_execution"))
+        record.trace_id = getattr(record, "trace_id", ctx.get("trace_id", "N/A"))
+        record.file_name = getattr(record, "file_name", ctx.get("file_name", "N/A"))
+        record.chunk_index = getattr(record, "chunk_index", ctx.get("chunk_index", None))
+        return True
 
-# Ensure directories exist
-INPUT_DIR.mkdir(parents=True, exist_ok=True)
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-LOG_DIR.mkdir(parents=True, exist_ok=True)
-
-# Configure Logging
-logging.basicConfig(
-    filename=LOG_DIR / "pipeline_run.log",
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
-
-console = Console()
-
-# Secure Client Initialization
-client_kwargs = {"host": OLLAMA_HOST}
-OLLAMA_SECRET = os.getenv("OLLAMA_SECRET", "").strip()
-if OLLAMA_SECRET:
-    client_kwargs["headers"] = {"Authorization": f"Bearer {OLLAMA_SECRET}"}
-
-client = ollama.AsyncClient(**client_kwargs)
-
-# ==========================================
-# 1. Define Pydantic Validation Models
-# ==========================================
-class DirectQAPair(BaseModel):
-    instruction: str
-    output: str
-
-class CoTPair(BaseModel):
-    instruction: str
-    reasoning: str
-    output: str
-
-class JudgeScore(BaseModel):
-    score: int
-
-def get_schema():
-    return CoTPair if GENERATION_STYLE == "cot" else DirectQAPair
-
-# ==========================================
-# 2. Core Utility Functions
-# ==========================================
-def extract_and_clean_text() -> str:
-    """Phase 1: Universal PDF processing with multi-document boundaries and fault tolerance."""
-    full_text = ""
-    for pdf_path in INPUT_DIR.glob("*.pdf"):
-        try:
-            with fitz.open(pdf_path) as doc:
-                full_text += f"\n\n--- Document: {pdf_path.name} ---\n\n"
-                for page in doc:
-                    text = page.get_text()
-                    text = re.sub(r'(?i)^\s*page\s*\d+\s*$', '', text, flags=re.MULTILINE)
-                    text = re.sub(r'(?<!\n)\n(?!\n)', ' ', text)
-                    full_text += text + "\n"
-        except Exception as e:
-            console.print(f"[red]Warning: Failed to read {pdf_path.name}: {e}[/red]")
-            logging.warning(f"Failed to read {pdf_path.name}: {e}")
-            
-    return full_text
-
-def get_chunk_hash(text: str) -> str:
-    """Generate a unique Hash ID for a text chunk."""
-    return hashlib.md5(text.encode('utf-8')).hexdigest()
-
-def load_checkpoints() -> dict:
-    """Load checkpoint state for resuming interrupted processes (Zero-byte resilient)."""
-    if CHECKPOINT_FILE.exists() and CHECKPOINT_FILE.stat().st_size > 0:
-        try:
-            with open(CHECKPOINT_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except json.JSONDecodeError:
-            logging.warning(f"Checkpoint file {CHECKPOINT_FILE} is corrupted. Resetting state.")
-            return {}
-    return {}
-
-def save_checkpoint(state: dict):
-    """Save the current checkpoint state."""
-    with open(CHECKPOINT_FILE, 'w', encoding='utf-8') as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
-
-def extract_json(response_text: str) -> str:
-    """Omni-Directional JSON Extractor for handling arrays and objects even without Markdown tags."""
-    match = re.search(r'`{3}(?:json)?\s*([\s\S]*?)`{3}', response_text)
-    if match:
-        return match.group(1).strip()
-    
-    first_bracket, last_bracket = response_text.find('['), response_text.rfind(']')
-    first_brace, last_brace = response_text.find('{'), response_text.rfind('}')
-    
-    starts = [idx for idx in (first_bracket, first_brace) if idx != -1]
-    ends = [idx for idx in (last_bracket, last_brace) if idx != -1]
-    
-    if starts and ends:
-        start_idx = min(starts)
-        end_idx = max(ends)
-        if end_idx > start_idx:
-            return response_text[start_idx:end_idx+1]
-            
-    return response_text.strip()
-
-# ==========================================
-# 3. LLM Interaction & Processing Logic
-# ==========================================
-async def detect_domain_persona(text: str) -> str:
-    """NEW Phase: Automatically detect the document domain with strict structural boundaries."""
-    console.print("[cyan]Auto-detecting document domain and generating persona...[/cyan]")
-    
-    prompt = f"""
-    You are an expert taxonomy AI. Analyze the <input_text> and determine its professional domain.
-    Based on that, write EXACTLY ONE sentence that acts as a system prompt for an AI expert in this domain.
-    Start the sentence with "You are an expert...". Do not output anything else.
-    
-    <example>
-    <input_text>The patient presents with acute myocardial infarction and requires immediate ECG monitoring.</input_text>
-    Output: You are an expert medical AI assistant specializing in cardiology and patient care.
-    </example>
-    
-    <input_text>
-    {text[:5000]}
-    </input_text>
-    
-    Output:
-    """
-    try:
-        response = await client.generate(
-            model=OLLAMA_MODEL,
-            prompt=prompt,
-            options={"num_ctx": NUM_CTX, "temperature": 0.1, "num_predict": 50}
-        )
-        persona = response['response'].strip().strip('"').strip("'")
+class ProductionJSONFormatter(logging.Formatter):
+    """Bulletproof, non-blocking JSON formatter for high-concurrency async pipelines."""
+    def format(self, record):
+        log_obj = {
+            "timestamp": datetime.fromtimestamp(record.created, timezone.utc).isoformat(),
+            "level": record.levelname,
+            "pipeline_stage": record.pipeline_stage,
+            "trace_id": record.trace_id,
+            "file_name": record.file_name,
+            "chunk_index": record.chunk_index,
+            "message": record.getMessage()
+        }
         
-        # Comprehensive text cleanup for small models that output extra formatting
-        persona = re.sub(r'(?i)^(output|persona|system prompt):\s*', '', persona).strip()
-        
-        if not persona.startswith("You are"):
-            # Try to extract from the first occurrence of "You are" if buried in chat clutter
-            match = re.search(r'(You are .*?\.)', persona)
-            if match:
-                persona = match.group(1)
-            else:
-                persona = f"You are an expert assistant. {persona}"
-            
-        return persona
-    except Exception as e:
-        logging.error(f"Auto-persona detection failed: {e}")
-        return "You are a helpful and highly knowledgeable expert assistant."
-
-async def generate_global_context(text: str) -> str:
-    """Phase 2: Generate the Global Context Map for cross-document awareness."""
-    console.print("[cyan]Generating cross-document Global Context Map...[/cyan]")
-    prompt = f"""
-    As an expert AI Architect, analyze the following document excerpt. 
-    Identify the core dependencies, potential trade-offs, and operational intersections between the themes.
-    Summarize this into a 'Global Context Map' in under 500 words.
-    Document content: {text[:15000]}...
-    """
-    response = await client.generate(
-        model=OLLAMA_MODEL,
-        prompt=prompt,
-        options={"num_ctx": NUM_CTX, "temperature": 0.1}
-    )
-    return response['response']
-
-async def evaluate_quality_with_judge(instruction: str, output: str, source_text: str) -> int:
-    """Phase 4: LLM-as-a-Judge to filter out hallucinations."""
-    prompt = f"""
-    As a strict AI Auditor, review the following question and answer pair.
-    Ensure it is entirely based on the provided source text and contains no fabricated information.
-    Give a score from 1 to 5 (5 = perfectly faithful to the source, 1 = contains hallucinations).
-    Strictly return ONLY JSON format: {{"score": number}}.
-
-    Source Text: {source_text}
-    Generated Question: {instruction}
-    Generated Answer: {output}
-    """
-    try:
-        response = await client.generate(
-            model=OLLAMA_MODEL, prompt=prompt, format="json",
-            options={"temperature": 0.0, "num_predict": 100}
-        )
-        score_data = JudgeScore.model_validate_json(extract_json(response['response']))
-        return score_data.score
-    except Exception as e:
-        logging.error(f"Judge evaluation failed: {e}")
-        return 0
-
-async def process_chunk(chunk: str, global_context: str, quota: int, sem: asyncio.Semaphore, progress, task_id, global_state: dict, active_persona: str) -> int:
-    """Phases 3 & 4: Process a single chunk asynchronously with strict state preservation."""
-    chunk_hash = get_chunk_hash(chunk)
-    
-    if global_state.get(chunk_hash) == "completed":
-        progress.update(task_id, advance=1)
-        return 0
-
-    async with sem:
-        SchemaModel = get_schema()
-        
-        system_prompt = f"【Global Context】:\n{global_context}\n\n"
-        format_req = (
-            'must contain "instruction", "reasoning", and "output" keys' 
-            if GENERATION_STYLE == 'cot' else 'must contain "instruction" and "output" keys'
-        )
-        
-        base_prompt = f"""
-        {system_prompt}
-        Based on the following 【Current Chunk】, and referencing the depth of the 【Global Context】, generate {quota} training data pairs.
-        All output text MUST be in {TARGET_LANGUAGE}.
-        Strictly return a JSON Array format, where each object {format_req}. Do not output any other text.
-        【Current Chunk】:\n{chunk}
-        """
-
-        retries = 3
-        raw_json = ""
-        current_prompt = base_prompt
-        chunk_processed_successfully = False
-        valid_data = []
-        
-        while retries > 0:
-            valid_data = []  # Wipes clean on retry to prevent dirty data duplication
-            try:
-                response = await client.generate(
-                    model=OLLAMA_MODEL, prompt=current_prompt, format="json",
-                    options={"num_ctx": NUM_CTX, "num_predict": NUM_PREDICT, "temperature": TEMPERATURE}
-                )
-                
-                raw_json = extract_json(response['response'])
-                parsed_list = json.loads(raw_json)
-                
-                if isinstance(parsed_list, dict):
-                    parsed_list = [parsed_list]
-                
-                for item in parsed_list:
-                    validated_item = SchemaModel(**item)
-                    
-                    # Low-Spec Hardware Optimization: Bypass AI Judge if threshold is set to minimum (1)
-                    if MIN_QUALITY_SCORE <= 1:
-                        score = 5
-                    else:
-                        score = await evaluate_quality_with_judge(
-                            validated_item.instruction, validated_item.output, chunk
-                        )
-                    
-                    if score >= MIN_QUALITY_SCORE:
-                        valid_data.append(validated_item)
-                    else:
-                        logging.info(f"AI Judge discarded low-quality data (Score: {score})")
-                
-                chunk_processed_successfully = True
-                break 
-                
-            except (json.JSONDecodeError, ValidationError) as e:
-                logging.error(f"JSON parsing error. Retrying... Attempts left: {retries - 1}")
-                # Clean retry prompt structure designed for easily distracted small models
-                current_prompt = base_prompt + f"\n\n[CRITICAL ERROR CORRECTION]\nYour previous output failed validation with error: {str(e)}.\nDo not repeat the error. Rewrite the output as a pure JSON array now."
-                retries -= 1
-            except Exception as e:
-                logging.error(f"Ollama API or Network error: {e}. Retrying... Attempts left: {retries - 1}")
-                await asyncio.sleep(2)
-                retries -= 1
-
-        if chunk_processed_successfully:
-            async with file_lock:
-                out_path = OUTPUT_DIR / f"dataset_{GENERATION_STYLE}.jsonl"
-                with open(out_path, 'a', encoding='utf-8') as f:
-                    for item in valid_data:
-                        content = (f"<think>\n{item.reasoning}\n</think>\n\n{item.output}" 
-                                   if GENERATION_STYLE == 'cot' else item.output)
-                        
-                        sharegpt_record = {
-                            "messages": [
-                                {"role": "system", "content": active_persona},
-                                {"role": "user", "content": item.instruction},
-                                {"role": "assistant", "content": content}
-                            ]
-                        }
-                        f.write(json.dumps(sharegpt_record, ensure_ascii=False) + '\n')
-
-                global_state[chunk_hash] = "completed"
-                save_checkpoint(global_state)
-            
-            progress.update(task_id, advance=1)
-            return len(valid_data)
-        else:
-            logging.warning(f"Chunk abandoned after 3 failed attempts. Leaving uncompleted for next run.")
-            progress.update(task_id, advance=1)
-            return 0
-
-# ==========================================
-# 4. Main Execution Pipeline
-# ==========================================
-async def main():
-    console.rule("[bold blue]Enterprise SLM Fine-Tuning Data Generation Pipeline Initialized[/bold blue]")
-    
-    raw_text = extract_and_clean_text()
-    if not raw_text.strip():
-        console.print("[red]Error: No valid text extracted. Ensure PDF files are in the data_input/ directory.[/red]")
-        return
-        
-    if SYSTEM_PROMPT.lower() == "auto":
-        active_persona = await detect_domain_persona(raw_text)
-        console.print(f"🤖 [bold green]Auto-detected Persona:[/bold green] [magenta]{active_persona}[/magenta]")
-    else:
-        active_persona = SYSTEM_PROMPT
-
-    encoder = tiktoken.get_encoding("cl100k_base")
-    total_tokens = len(encoder.encode(raw_text, disallowed_special=()))
-    max_safe_yield = total_tokens // TOKENS_PER_PAIR
-    
-    console.print(f"📄 Total Source Tokens: ~{total_tokens}")
-    console.print(f"🛡️  Safe Generation Upper Limit ({GENERATION_STYLE.upper()}): [green]{max_safe_yield}[/green] pairs")
-
-    if TARGET_YIELD > max_safe_yield:
-        console.print(f"[bold red]Warning: Requested yield ({TARGET_YIELD}) exceeds the safe limit ({max_safe_yield})![/bold red]")
-        if not AUTO_BYPASS:
-            if not Confirm.ask("Do you wish to force execution anyway?"):
-                console.print("[yellow]Execution aborted safely.[/yellow]")
-                return
-
-    global_context = await generate_global_context(raw_text)
-    
-    splitter = RecursiveCharacterTextSplitter(chunk_size=3000, chunk_overlap=300)
-    chunks = splitter.split_text(raw_text)
-    
-    if TARGET_YIELD <= len(chunks):
-        console.print(f"[yellow]Notice: TARGET_YIELD ({TARGET_YIELD}) is smaller than or equal to chunk count ({len(chunks)}). Using exactly {TARGET_YIELD} chunks.[/yellow]")
-        chunks = chunks[:TARGET_YIELD]
-        quotas = [1] * TARGET_YIELD
-    else:
-        base_quota = TARGET_YIELD // len(chunks)
-        remainder = TARGET_YIELD % len(chunks)
-        quotas = [base_quota + 1 if i < remainder else base_quota for i in range(len(chunks))]
-    
-    console.print(f"📦 Processing {len(chunks)} chunks to target exactly {TARGET_YIELD} pairs.")
-    console.print("[dim](Note: Final saved yield may be slightly lower due to strict AI Judge filtering)[/dim]")
-
-    sem = asyncio.Semaphore(CONCURRENCY_LIMIT)
-    total_valid_yield = 0
-    
-    global_state = load_checkpoints()
-    out_path = OUTPUT_DIR / f"dataset_{GENERATION_STYLE}.jsonl"
-    
-    if not global_state and out_path.exists():
-        backup_path = OUTPUT_DIR / f"dataset_{GENERATION_STYLE}_backup_{int(time.time())}.jsonl"
-        out_path.rename(backup_path)
-        console.print(f"[yellow]⚠️ Notice: Empty state detected but previous output exists. Renamed old data to {backup_path.name} to prevent duplication.[/yellow]")
-    
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TaskProgressColumn(),
-        console=console,
-    ) as progress:
-        task_id = progress.add_task("[cyan]Processing chunks and generating data...", total=len(chunks))
-        
-        tasks = [
-            process_chunk(chunk, global_context, quotas[i], sem, progress, task_id, global_state, active_persona)
-            for i, chunk in enumerate(chunks)
+        telemetry_keys = [
+            "retry_count", "ai_score", "error_type", 
+            "latency_ms", "raw_output_length", "pydantic_errors"
         ]
         
-        results = await asyncio.gather(*tasks)
-        total_valid_yield = sum(results)
+        for key in telemetry_keys:
+            if hasattr(record, key):
+                log_obj[key] = getattr(record, key)
+                
+        if record.exc_info:
+            log_obj["stack_trace"] = self.formatException(record.exc_info)
+            
+        return json.dumps(log_obj, default=str)
 
-    console.rule("[bold green]Pipeline Execution Complete[/bold green]")
-    console.print(f"🎉 Successfully generated and saved [bold yellow]{total_valid_yield}[/bold yellow] high-quality {GENERATION_STYLE.upper()} data pairs!")
-    console.print(f"📂 Output location: {OUTPUT_DIR}/dataset_{GENERATION_STYLE}.jsonl")
+# Initialize Master Logger
+logger = logging.getLogger("Doc2SFT_Telemetry")
+logger.setLevel(logging.DEBUG)
+
+# Attach the filter to the logger so it runs in the main async thread
+logger.addFilter(ContextInjectingFilter())
+
+# Initialize Non-Blocking Background Queue Logger
+log_queue = queue.Queue(-1)
+queue_handler = logging.handlers.QueueHandler(log_queue)
+logger.addHandler(queue_handler)
+
+os.makedirs("logs", exist_ok=True)
+file_target = logging.FileHandler("logs/traceability.jsonl", encoding="utf-8")
+file_target.setFormatter(ProductionJSONFormatter())
+file_target.setLevel(logging.DEBUG)
+
+console_target = logging.StreamHandler()
+console_target.setFormatter(logging.Formatter('%(levelname)s - [%(pipeline_stage)s] %(message)s'))
+console_target.setLevel(logging.INFO)
+
+listener = logging.handlers.QueueListener(log_queue, file_target, console_target, respect_handler_level=True)
+listener.start()
+
+# =====================================================================
+# 2. CONFIGURATION LOADER
+# =====================================================================
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:14b")
+INPUT_DIR = os.getenv("INPUT_DIR", "./data_input")
+OUTPUT_DIR = os.getenv("OUTPUT_DIR", "./data_output")
+CHECKPOINT_FILE = os.getenv("CHECKPOINT_FILE", "./logs/state.json")
+GENERATION_STYLE = os.getenv("GENERATION_STYLE", "qa")
+
+# Performance & Context Window Management
+MIN_QUALITY_SCORE = int(os.getenv("MIN_QUALITY_SCORE", "4"))
+CONCURRENCY_LIMIT = int(os.getenv("CONCURRENCY_LIMIT", "2"))
+OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX_QA", "4096"))
+OLLAMA_NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT_QA", "1000"))
+
+os.makedirs(INPUT_DIR, exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# Shared Global Locks for Async File Access
+file_write_lock = asyncio.Lock()
+state_write_lock = asyncio.Lock()
+
+# =====================================================================
+# 3. DATA SCHEMA SCHEMATICS (PYDANTIC V2)
+# =====================================================================
+class ShareGPTMessage(BaseModel):
+    role: str = Field(..., description="System, user, or assistant role")
+    content: str = Field(..., description="The main text body")
+
+class ShareGPTData(BaseModel):
+    messages: List[ShareGPTMessage]
+
+class JudgeScore(BaseModel):
+    score: int = Field(..., ge=1, le=5, description="Factual matching score 1 to 5")
+    reasoning: str = Field(..., description="Audit justification")
+
+# =====================================================================
+# 4. UTILITIES & DATA PARSING EXTRACTIONS
+# =====================================================================
+def omni_extract_json(raw_string: str) -> str:
+    """Uses robust boundary detection to safely extract hidden JSON structures."""
+    raw_string = raw_string.strip()
+    
+    start_obj, end_obj = raw_string.find('{'), raw_string.rfind('}')
+    start_arr, end_arr = raw_string.find('['), raw_string.rfind(']')
+    
+    if start_obj != -1 and end_obj != -1 and (start_arr == -1 or start_obj < start_arr):
+        return raw_string[start_obj:end_obj+1]
+    elif start_arr != -1 and end_arr != -1:
+        return raw_string[start_arr:end_arr+1]
+        
+    return raw_string
+
+async def call_ollama_endpoint(prompt: str, system: Optional[str] = None, response_format: Optional[str] = None) -> str:
+    """Handles async inference using the official Ollama AsyncClient with an optional JSON Grammar Mask."""
+    client = AsyncClient(host=OLLAMA_HOST)
+    
+    payload = {
+        "model": OLLAMA_MODEL,
+        "prompt": prompt,
+        "stream": False,
+        "options": {
+            "temperature": 0.1,
+            "num_ctx": OLLAMA_NUM_CTX,
+            "num_predict": OLLAMA_NUM_PREDICT
+        }
+    }
+    
+    # Strictly enforce C-level JSON grammar rendering if requested
+    if response_format == "json":
+        payload["format"] = "json"
+        
+    if system:
+        payload["system"] = system
+
+    try:
+        response = await client.generate(**payload)
+        return response.get("response", "")
+    except Exception as e:
+        raise RuntimeError(f"Ollama Endpoint Failed: {str(e)}")
+
+# =====================================================================
+# 5. DATA INGESTION & SEMANTIC SEGMENTATION
+# =====================================================================
+def extract_pdf_text(path: str) -> str:
+    reader = PdfReader(path)
+    return "".join([page.extract_text() or "" for page in reader.pages])
+
+async def generate_global_context_map(full_text: str, file_name: str) -> str:
+    """Creates a high-level metadata layout of the entire document to combat chunk myopia."""
+    logger_ctx.set({"stage": "ingestion_context_mapping", "file_name": file_name, "trace_id": "global-map"})
+    logger.info(f"Initiating Global Context Map sequence for {file_name}.")
+    
+    truncated_text = full_text[:12000]
+    prompt = (
+        f"Analyze this document snippet and generate a dense 3-sentence summary highlighting the primary "
+        f"domain, core objective, and technical context. Output ONLY the summary.\n\nText:\n{truncated_text}"
+    )
+    try:
+        start_time = time.perf_counter()
+        context_map = await call_ollama_endpoint(prompt) # Purposefully omits JSON format
+        latency = int((time.perf_counter() - start_time) * 1000)
+        logger.info("Global Context Map locked and compiled.", extra={"latency_ms": latency})
+        return context_map
+    except Exception as e:
+        logger.error(f"Failed to generate Global Context Map: {str(e)}", exc_info=True)
+        return "General enterprise operational context guidelines."
+
+def recursive_chunk_engine(text: str, size: int = 2000, overlap: int = 300) -> List[str]:
+    """Uses LangChain to ensure chunks break cleanly at paragraph or sentence boundaries."""
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=size,
+        chunk_overlap=overlap,
+        length_function=len,
+        is_separator_regex=False,
+        separators=["\n\n", "\n", ".", " ", ""]
+    )
+    return text_splitter.split_text(text)
+
+# =====================================================================
+# 6. CORE PROCESSING PIPELINE STATE MACHINE
+# =====================================================================
+async def process_chunk(chunk_text: str, chunk_idx: int, file_name: str, file_hash: str, global_map: str):
+    trace_id = f"{file_hash}-chunk-{chunk_idx}"
+    logger_ctx.set({"trace_id": trace_id, "file_name": file_name, "chunk_index": chunk_idx, "stage": "async_dispatch"})
+    
+    logger.debug(f"Chunk {chunk_idx} dispatched to pipeline execution slot.")
+    
+    # -----------------------------------------------------------------
+    # STAGE 1 & 2: GENERATION WITH SELF-HEALING RETRY LOOPS
+    # -----------------------------------------------------------------
+    max_retries = 3
+    retry_count = 0
+    validated_data: Optional[ShareGPTData] = None
+    
+    base_prompt = (
+        f"You are a training data generation engine. Based on the following context, generate a JSON array "
+        f"containing 2 high-quality Question/Answer pairs matching the ShareGPT standard format schema. "
+        f"Ensure values are factual and directly inferred from the chunk text.\n\n"
+        f"Global System Context: {global_map}\n\n"
+        f"Chunk Ground Truth Text:\n{chunk_text}\n\n"
+        f"OUTPUT ONLY RAW JSON COMPLYING EXACTLY WITH THIS PYDANTIC EXPECTATION:\n"
+        f'{{"messages": [{{"role": "user", "content": "question"}}, {{"role": "assistant", "content": "answer"}}]}}'
+    )
+    
+    current_prompt = base_prompt
+    
+    while retry_count < max_retries:
+        try:
+            ctx = logger_ctx.get().copy()
+            ctx["stage"] = "llm_inference"
+            logger_ctx.set(ctx)
+            
+            start_time = time.perf_counter()
+            # Enforce JSON Mask
+            raw_output = await call_ollama_endpoint(current_prompt, response_format="json")
+            latency = int((time.perf_counter() - start_time) * 1000)
+            
+            ctx["stage"] = "pydantic_validation"
+            logger_ctx.set(ctx)
+            
+            clean_json = omni_extract_json(raw_output)
+            
+            if not clean_json.startswith("{") and not clean_json.startswith("["):
+                raise ValueError("Extracted string failed structural bounding constraints.")
+                
+            if clean_json.startswith("["):
+                clean_json = f'{{"messages": {clean_json}}}'
+                
+            validated_data = ShareGPTData.model_validate_json(clean_json)
+            logger.debug("Structural validation passed.", extra={"latency_ms": latency, "raw_output_length": len(raw_output)})
+            break
+            
+        except (ValidationError, ValueError, Exception) as e:
+            retry_count += 1
+            ctx = logger_ctx.get().copy()
+            ctx["stage"] = "retry_engine"
+            logger_ctx.set(ctx)
+            
+            pydantic_payload = e.errors() if isinstance(e, ValidationError) else [{"msg": str(e)}]
+            
+            logger.warning(
+                f"Validation collapsed. Initiating isolated retry attempt {retry_count}/{max_retries}.",
+                extra={"retry_count": retry_count, "error_type": type(e).__name__, "pydantic_errors": pydantic_payload}
+            )
+            current_prompt = f"{base_prompt}\n\nCRITICAL FIX REQUIRED: Your previous execution failed with structural error: {str(pydantic_payload)}. Re-output clean valid schema elements."
+            
+    if not validated_data:
+        ctx = logger_ctx.get().copy()
+        ctx["stage"] = "quarantine"
+        logger_ctx.set(ctx)
+        logger.error(f"Max system processing loops exhausted for Chunk {chunk_idx}. Data quarantined.", extra={"retry_count": retry_count})
+        return
+        
+    # -----------------------------------------------------------------
+    # STAGE 3: ENTERPRISE AUDITOR (LLM-AS-A-JUDGE HALLUCINATION FILTER)
+    # -----------------------------------------------------------------
+    if MIN_QUALITY_SCORE > 1:
+        ctx = logger_ctx.get().copy()
+        ctx["stage"] = "ai_judge_audit"
+        logger_ctx.set(ctx)
+        
+        judge_prompt = (
+            f"Act as a ruthless enterprise Data Compliance Auditor. Evaluate if the generated QA metrics "
+            f"accurately reflect the ground truth content without introducing hallucinations or outside assumptions.\n\n"
+            f"Ground Truth Slice:\n{chunk_text}\n\n"
+            f"Generated Pipeline Output:\n{validated_data.model_dump_json()}\n\n"
+            f"Return a JSON object specifying a quality score integer from 1 to 5 (5 being pristine) and a clear reasoning string.\n"
+            f"OUTPUT ONLY VALUED FORMAT MATCHING:\n"
+            f'{{"score": 5, "reasoning": "text"}}'
+        )
+        
+        try:
+            # Enforce JSON Mask for the auditor as well
+            judge_raw = await call_ollama_endpoint(judge_prompt, response_format="json")
+            judge_clean = omni_extract_json(judge_raw)
+            parsed_score = JudgeScore.model_validate_json(judge_clean)
+            
+            logger.info(
+                f"AI Judge audit completed. Score: {parsed_score.score}/5", 
+                extra={"ai_score": parsed_score.score, "judge_reasoning": parsed_score.reasoning}
+            )
+            
+            if parsed_score.score < MIN_QUALITY_SCORE:
+                logger.warning(f"Chunk {chunk_idx} discarded due to low quality score assignment.")
+                return
+        except Exception as e:
+            logger.error(f"Auditor routing collapsed: {str(e)}. Defaulting to rejection safety protocol.")
+            return
+
+    # -----------------------------------------------------------------
+    # STAGE 4: ASYNC ATOMIC WRITES & STATE COMMIT
+    # -----------------------------------------------------------------
+    ctx = logger_ctx.get().copy()
+    ctx["stage"] = "state_commit"
+    logger_ctx.set(ctx)
+    
+    async with file_write_lock:
+        output_path = os.path.join(OUTPUT_DIR, f"dataset_{GENERATION_STYLE}.jsonl")
+        with open(output_path, "a", encoding="utf-8") as f:
+            f.write(validated_data.model_dump_json() + "\n")
+            
+    async with state_write_lock:
+        state_data = {}
+        if os.path.exists(CHECKPOINT_FILE):
+            try:
+                with open(CHECKPOINT_FILE, "r", encoding="utf-8") as sf:
+                    state_data = json.load(sf)
+            except Exception:
+                state_data = {}
+                
+        if file_hash not in state_data:
+            state_data[file_hash] = []
+        state_data[file_hash].append(chunk_idx)
+        
+        with open(CHECKPOINT_FILE, "w", encoding="utf-8") as sf:
+            json.dump(state_data, sf, indent=2)
+            
+    logger.info(f"Pipeline processing completely closed out for Chunk {chunk_idx}. Chkpnt written.", extra={"status": "completed"})
+
+# =====================================================================
+# 7. ASYNC ORCHESTRATION & SEMAPHORE CONTROL HANDLERS
+# =====================================================================
+async def main_orchestration_loop():
+    logger_ctx.set({"stage": "system_initialization", "trace_id": "core-init"})
+    logger.info("Initializing Doc2SFT Master Core Orchestration Pipeline Engine.")
+    
+    checkpoint_state = {}
+    if os.path.exists(CHECKPOINT_FILE):
+        try:
+            with open(CHECKPOINT_FILE, "r", encoding="utf-8") as sf:
+                checkpoint_state = json.load(sf)
+        except Exception:
+            logger.warning("State checkpoint file unreadable. Overwriting with clean blueprint framework mappings.")
+
+    target_files = [f for f in os.listdir(INPUT_DIR) if f.lower().endswith(".pdf")]
+    if not target_files:
+        logger.error(f"Zero source documents located in '{INPUT_DIR}'. Execution halted.")
+        return
+
+    semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
+    
+    async def bounded_worker(chunk_text, chunk_idx, file_name, file_hash, global_map):
+        async with semaphore:
+            await process_chunk(chunk_text, chunk_idx, file_name, file_hash, global_map)
+
+    tasks = []
+    for file_name in target_files:
+        file_path = os.path.join(INPUT_DIR, file_name)
+        
+        with open(file_path, "rb") as f:
+            file_hash = hashlib.sha256(f.read()).hexdigest()[:16]
+            
+        logger.info(f"Ingesting: '{file_name}' | Fingerprint Map Identity: [{file_hash}]")
+        
+        try:
+            raw_text = extract_pdf_text(file_path)
+            if not raw_text.strip():
+                logger.warning(f"File '{file_name}' possesses no printable text objects. Skipping.")
+                continue
+                
+            global_map = await generate_global_context_map(raw_text, file_name)
+            chunks = recursive_chunk_engine(raw_text)
+            completed_indices = checkpoint_state.get(file_hash, [])
+            
+            for idx, chunk_content in enumerate(chunks):
+                if idx in completed_indices:
+                    continue
+                tasks.append(bounded_worker(chunk_content, idx, file_name, file_hash, global_map))
+                
+        except Exception as e:
+            logger.critical(f"Inability to initialize structural parsing constraints against '{file_name}': {str(e)}", exc_info=True)
+
+    if tasks:
+        logger.info(f"Asynchronous queue compiled. Spawning {len(tasks)} isolated context validation workers.")
+        await asyncio.gather(*tasks)
+    else:
+        logger.info("All detected storage block components match active checkpoint indexes. Zero execution steps required.")
+
+    logger.info("Pipeline execution operations finalized. Tearing down background telemetry logging loops safely.")
+    listener.stop()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(main_orchestration_loop())

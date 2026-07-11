@@ -45,3 +45,8 @@ env/
 .Trashes
 ehthumbs.db
 Thumbs.db
+
+# ==========================================
+# 5. Old Versions of Scripts
+# ==========================================
+generate_data_v1.py
